@@ -228,6 +228,9 @@ class RawChannelWriter(RawIOBase, AbstractContextManager):
 
     def write(self, __b: bytes) -> int | None:
         try:
+            if not self._channel.wait_for_ready_to_send():
+                raise RNS.Channel.ChannelException(RNS.Channel.CEType.ME_SHUTDOWN, "Cannot write to shutdown Channel")
+
             comp_tries = RawChannelWriter.COMPRESSION_TRIES
             comp_try = 1
             comp_success = False
@@ -264,17 +267,17 @@ class RawChannelWriter(RawIOBase, AbstractContextManager):
         return 0
 
     def close(self):
-        try:
-            link_rtt = self._channel._outlet.link.rtt
-            timeout = time.time() + (link_rtt * len(self._channel._tx_ring) * 1)
-        except Exception as e:
-            timeout = time.time() + 15
-
-        while time.time() < timeout and not self._channel.is_ready_to_send():
-            time.sleep(0.05)
+        if self._eof: return
 
         self._eof = True
-        self.write(bytes())
+        try:
+            link_rtt = self._channel._outlet.link.rtt
+            timeout = link_rtt * len(self._channel._tx_ring) * 1
+        except Exception as e:
+            timeout = 15
+        
+        if self._channel.wait_for_ready_to_send(timeout):
+            self.write(bytes())
 
     def __enter__(self):
         return self

@@ -112,6 +112,7 @@ class CEType(enum.IntEnum):
     ME_LINK_NOT_READY   = 3
     ME_ALREADY_SENT     = 4
     ME_TOO_BIG          = 5
+    ME_SHUTDOWN         = 6
 
 
 class ChannelException(Exception):
@@ -285,6 +286,7 @@ class Channel(contextlib.AbstractContextManager):
         """
         self._outlet = outlet
         self._lock = threading.RLock()
+        self._tx_ring_ready = threading.Condition(self._lock)
         self._tx_ring: collections.deque[Envelope] = collections.deque()
         self._rx_ring: collections.deque[Envelope] = collections.deque()
         self._message_callbacks: [MessageCallbackType] = []
@@ -294,6 +296,7 @@ class Channel(contextlib.AbstractContextManager):
         self._max_tries = 5
         self.fast_rate_rounds    = 0
         self.medium_rate_rounds  = 0
+        self._is_shutdown = False
 
         if self._outlet.rtt > Channel.RTT_SLOW:
             self.window              = 1
@@ -375,6 +378,7 @@ class Channel(contextlib.AbstractContextManager):
         with self._lock:
             self._message_callbacks.clear()
             self._clear_rings()
+            self._is_shutdown = True
 
     def _clear_rings(self):
         with self._lock:
@@ -384,6 +388,7 @@ class Channel(contextlib.AbstractContextManager):
                     self._outlet.set_packet_delivered_callback(envelope.packet, None)
             self._tx_ring.clear()
             self._rx_ring.clear()
+            self._tx_ring_ready.notify_all()
 
     def _emplace_envelope(self, envelope: Envelope, ring: collections.deque[Envelope]) -> bool:
         with self._lock:
@@ -470,6 +475,9 @@ class Channel(contextlib.AbstractContextManager):
 
         :return: True if ready
         """
+        if self._is_shutdown:
+            return False
+
         if not self._outlet.is_usable:
             return False
 
@@ -485,6 +493,22 @@ class Channel(contextlib.AbstractContextManager):
 
         return True
 
+    def wait_for_ready_to_send(self, timeout=None):
+        """
+        Block until the ``Channel`` is ready to send
+
+        :param timeout: Optionally wait at most ``timeout`` seconds
+        :return: True if ready. False if timedout or the ``Channel`` has shutdown
+        """
+        with self._tx_ring_ready:
+            while True:
+                if self.is_ready_to_send():
+                    return True
+                if self._is_shutdown:
+                    return False
+                if not self._tx_ring_ready.wait(timeout):
+                    return False # timedout
+
     def _packet_tx_op(self, packet: TPacket, op: Callable[[TPacket], bool]):
         with self._lock:
             envelope = next(filter(lambda e: self._outlet.get_packet_id(e.packet) == self._outlet.get_packet_id(packet),
@@ -494,6 +518,7 @@ class Channel(contextlib.AbstractContextManager):
                 envelope.tracked = False
                 if envelope in self._tx_ring:
                     self._tx_ring.remove(envelope)
+                    self._tx_ring_ready.notify()
 
                     if self.window < self.window_max:
                         self.window += 1
@@ -587,6 +612,8 @@ class Channel(contextlib.AbstractContextManager):
         """
         envelope: Envelope | None = None
         with self._lock:
+            if self._is_shutdown:
+                raise ChannelException(CEType.ME_SHUTDOWN, "Trying to send over shutdown Channel")
             if not self.is_ready_to_send():
                 raise ChannelException(CEType.ME_LINK_NOT_READY, f"Link is not ready")
         
